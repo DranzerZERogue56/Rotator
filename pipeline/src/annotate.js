@@ -1,13 +1,19 @@
-// Sends each analysis window to Claude, asking it to find the single most
-// teachable moment and return a verbatim passage plus a lesson. Results are
-// written incrementally to data/candidates.json for human review in
-// review/index.html. Run with: npm run annotate -- --limit 20
+// Sends each analysis window to Claude — via a headless `claude -p` CLI
+// call, using whatever Claude Code login/subscription is already on this
+// machine instead of a separate ANTHROPIC_API_KEY — asking it to find the
+// single most teachable moment and return a verbatim passage plus a lesson.
+// Results are written incrementally to data/candidates.json for human
+// review in review/index.html. Run with: npm run annotate -- --limit 20
+//
+// Requires the `claude` CLI installed and logged in (run `claude` once
+// interactively to log in, or set ANTHROPIC_API_KEY) on whatever machine
+// runs this script.
 
 import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
-import Anthropic from "@anthropic-ai/sdk";
+import { spawn, spawnSync } from "node:child_process";
 import { buildWindows, windowText } from "./window.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -21,8 +27,13 @@ const candidatesPath = path.join(pipelineRoot, "data", "candidates.json");
 // the old prompt aren't reused as if they came from the new one.
 const PROMPT_VERSION = 1;
 const MODEL = "claude-sonnet-5";
+const CLAUDE_BIN = "claude";
 const CONCURRENCY = 4;
-const MAX_RATE_LIMIT_RETRIES = 5;
+const MAX_RETRIES = 5;
+// HTTP statuses worth retrying: rate limited, overloaded, or a transient
+// server-side failure. Anything else (bad request, auth, unknown model) is
+// not going to fix itself on retry.
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504, 529]);
 
 const LESSON_TYPES = new Set(["grammar", "vocab", "craft"]);
 const TITLE_STOPWORDS = new Set(["a", "an", "the", "of", "and", "in", "on", "for", "to", "or"]);
@@ -130,25 +141,68 @@ function appendCandidate(record) {
   return writeQueue;
 }
 
-async function callModel(client, excerptText) {
-  const response = await client.messages.create({
-    model: MODEL,
-    max_tokens: 2000,
-    system: PROMPT,
-    messages: [{ role: "user", content: excerptText }],
-  });
-  const textBlock = response.content.find((b) => b.type === "text");
-  return textBlock ? textBlock.text : "";
+// Thrown when the claude CLI itself reports an API-level failure
+// (envelope.is_error), carrying the HTTP status so the retry loop can tell
+// "rate limited, try again" apart from "this will never succeed".
+class ClaudeCliError extends Error {
+  constructor(message, apiErrorStatus) {
+    super(message);
+    this.apiErrorStatus = apiErrorStatus;
+  }
 }
 
-async function callModelWithRetry(client, excerptText) {
+// Runs one window through `claude -p`, piping the excerpt in on stdin so we
+// never have to shell-escape book text. --tools "" and --setting-sources ""
+// keep this a plain text-in/JSON-out call instead of a full agent session:
+// no file/bash access, and no CLAUDE.md or project settings bleeding into
+// the annotation prompt.
+function callModel(excerptText) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(CLAUDE_BIN, [
+      "-p",
+      "--output-format", "json",
+      "--model", MODEL,
+      "--tools", "",
+      "--setting-sources", "",
+      "--system-prompt", PROMPT,
+    ]);
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", (err) => {
+      reject(new Error(`could not run "${CLAUDE_BIN}" — is Claude Code installed and on PATH? (${err.message})`));
+    });
+    child.on("close", () => {
+      let envelope;
+      try {
+        envelope = JSON.parse(stdout);
+      } catch {
+        reject(new Error(`claude CLI produced non-JSON output: ${(stderr || stdout).slice(0, 300)}`));
+        return;
+      }
+      if (envelope.is_error) {
+        reject(new ClaudeCliError(envelope.result || "claude CLI reported an error", envelope.api_error_status));
+        return;
+      }
+      resolve(envelope.result ?? "");
+    });
+
+    child.stdin.write(excerptText);
+    child.stdin.end();
+  });
+}
+
+async function callModelWithRetry(excerptText) {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      return await callModel(client, excerptText);
+      return await callModel(excerptText);
     } catch (err) {
-      if (err instanceof Anthropic.RateLimitError && attempt < MAX_RATE_LIMIT_RETRIES) {
+      const retryable = err instanceof ClaudeCliError && RETRYABLE_STATUSES.has(err.apiErrorStatus);
+      if (retryable && attempt < MAX_RETRIES) {
         const backoffMs = 1000 * 2 ** attempt;
-        console.warn(`rate limited, retrying in ${backoffMs}ms`);
+        console.warn(`claude CLI call failed (status ${err.apiErrorStatus}), retrying in ${backoffMs}ms`);
         await sleep(backoffMs);
         continue;
       }
@@ -174,18 +228,18 @@ function resolveQuote(passage, quote, label) {
   return { start: firstIndex, end: firstIndex + quote.length };
 }
 
-async function annotateWindow(client, book, window) {
+async function annotateWindow(book, window) {
   const excerptText = windowText(window);
   const hash = hashWindow(excerptText);
 
   let result = await loadCache(hash);
   if (result === null) {
-    let raw = await callModelWithRetry(client, excerptText);
+    let raw = await callModelWithRetry(excerptText);
     let parsed = tryParse(raw);
 
     if (parsed && parsed.skip !== true && !isVerbatimPassage(excerptText, parsed)) {
       console.warn(`  retry ${book.gutenbergId}#${window.windowIndex}: passage not verbatim`);
-      raw = await callModelWithRetry(client, excerptText);
+      raw = await callModelWithRetry(excerptText);
       parsed = tryParse(raw);
     }
 
@@ -262,14 +316,22 @@ function parseArgs(argv) {
   return { limit };
 }
 
+function checkClaudeCliAvailable() {
+  const check = spawnSync(CLAUDE_BIN, ["--version"]);
+  if (check.error || check.status !== 0) {
+    console.error(`"${CLAUDE_BIN}" CLI not found or not working. Install Claude Code and run "claude" once to log in, then try again.`);
+    process.exit(1);
+  }
+}
+
 async function main() {
+  checkClaudeCliAvailable();
   const { limit } = parseArgs(process.argv.slice(2));
   const books = JSON.parse(await fs.readFile(booksPath, "utf8"));
   const existingCandidates = await readJsonIfExists(candidatesPath, []);
   const existingIds = new Set(existingCandidates.map((c) => c.id));
 
   await fs.mkdir(cacheDir, { recursive: true });
-  const client = new Anthropic();
   const limiter = createLimiter(CONCURRENCY);
 
   let processed = 0;
@@ -284,7 +346,7 @@ async function main() {
       if (existingIds.has(windowId(book, window))) continue;
       if (processed >= limit) break;
       processed += 1;
-      tasks.push(limiter(() => annotateWindow(client, book, window)));
+      tasks.push(limiter(() => annotateWindow(book, window)));
     }
   }
 

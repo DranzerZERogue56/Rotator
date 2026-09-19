@@ -11,8 +11,5 @@
     "clean": "node src/clean.js",
     "annotate": "node src/annotate.js",
     "validate": "node src/validate.js"
-  },
-  "dependencies": {
-    "@anthropic-ai/sdk": "^0.127.0"
   }
 }
