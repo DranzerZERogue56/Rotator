@@ -1,0 +1,18 @@
+{
+  "name": "marginalia-pipeline",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "fetch": "node src/fetch.js",
+    "clean": "node src/clean.js",
+    "annotate": "node src/annotate.js",
+    "validate": "node src/validate.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.127.0"
+  }
+}
